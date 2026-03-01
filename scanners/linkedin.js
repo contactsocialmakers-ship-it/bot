@@ -47,7 +47,7 @@ class LinkedInScanner {
   async scan() {
     if (!this.enabled) return [];
 
-    const valid = await this._checkSession();
+    const valid = await this.checkSession();
     if (!valid) {
       logger.error('LinkedIn: session expired — update LINKEDIN_LI_AT cookie');
       return [];
@@ -252,7 +252,7 @@ class LinkedInScanner {
   //  SESSION & HELPERS
   // ============================================================
 
-  async _checkSession() {
+  async checkSession() {
     try {
       const res = await axios.get(
         'https://www.linkedin.com/voyager/api/me',

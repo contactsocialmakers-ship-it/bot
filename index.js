@@ -126,8 +126,11 @@ class TaskerTimeBot {
       // On continue quand même, le bot retestera à chaque cycle
     }
 
-    // Premier cycle immédiat
-    await this.runCycle();
+    // Dashboard HTTP — DOIT démarrer en premier pour Railway
+    this._startDashboard();
+
+    // Premier cycle après 5s (laisse le serveur HTTP démarrer)
+    setTimeout(() => this.runCycle(), 5000);
 
     // Cycles réguliers
     cron.schedule(`*/${interval} * * * *`, () => this.runCycle());
@@ -143,9 +146,6 @@ class TaskerTimeBot {
       logger.info('Session health check...');
       this.linkedin.checkSession();
     });
-
-    // Dashboard HTTP
-    this._startDashboard();
 
     logger.info(`Bot running 24/7. Next scan in ${interval} min.`);
   }

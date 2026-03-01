@@ -5,8 +5,6 @@ const ReplyGenerator = require('../replyGenerator');
 
 // ============================================================
 //  LINKEDIN SCANNER — MODE COOKIES (li_at)
-//  Léger, rapide, pas besoin de Chrome/Puppeteer
-//  Même méthode que Waalaxy, Phantombuster, etc.
 // ============================================================
 
 class LinkedInScanner {
@@ -19,20 +17,6 @@ class LinkedInScanner {
     this.enabled = !!this.cookie;
     this._myUrn = null;
 
-    // Headers qui imitent un vrai navigateur
-    this.headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      Accept: 'application/vnd.linkedin.normalized+json+2.1',
-      'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
-      'x-li-lang': 'fr_FR',
-      'x-li-track':
-        '{"clientVersion":"1.13.8834","mpVersion":"1.13.8834","osName":"web","timezoneOffset":1,"deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1}',
-      'x-restli-protocol-version': '2.0.0',
-      Cookie: `li_at=${this.cookie}; JSESSIONID="${this.csrfToken}"`,
-      'csrf-token': this.csrfToken,
-    };
-
     if (this.enabled) {
       logger.info('LinkedIn scanner initialized (cookie mode)');
     } else {
@@ -40,18 +24,123 @@ class LinkedInScanner {
     }
   }
 
+  // Build headers fresh each time (csrf token may update)
+  _getHeaders() {
+    return {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      Accept: 'application/vnd.linkedin.normalized+json+2.1',
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Accept-Encoding': 'gzip, deflate, br',
+      Referer: 'https://www.linkedin.com/feed/',
+      Origin: 'https://www.linkedin.com',
+      'x-li-lang': 'fr_FR',
+      'x-li-page-instance': 'urn:li:page:feed_index;' + this._randomHex(8),
+      'x-li-track': JSON.stringify({
+        clientVersion: '1.13.8834',
+        mpVersion: '1.13.8834',
+        osName: 'web',
+        timezoneOffset: 1,
+        deviceFormFactor: 'DESKTOP',
+        mpName: 'voyager-web',
+        displayDensity: 1,
+      }),
+      'x-restli-protocol-version': '2.0.0',
+      'csrf-token': this.csrfToken,
+      Cookie: `li_at=${this.cookie}; JSESSIONID="${this.csrfToken}"; lang=v=2&lang=fr-fr`,
+    };
+  }
+
   // ============================================================
-  //  SCAN — Recherche de posts pertinents
+  //  SESSION CHECK
+  // ============================================================
+
+  async checkSession() {
+    if (!this.enabled) return false;
+
+    try {
+      // Step 1: If no CSRF token, get one from LinkedIn
+      if (!this.csrfToken) {
+        await this._fetchCsrfToken();
+      }
+
+      const res = await axios.get(
+        'https://www.linkedin.com/voyager/api/me',
+        {
+          headers: this._getHeaders(),
+          timeout: 15000,
+          maxRedirects: 3,
+          validateStatus: (status) => status < 400,
+        }
+      );
+
+      const profile = res.data?.miniProfile || res.data || {};
+      const name =
+        profile.firstName ||
+        res.data?.firstName?.localized?.fr_FR ||
+        res.data?.firstName?.localized?.en_US ||
+        'Unknown';
+
+      this._myUrn = profile.entityUrn || res.data?.entityUrn || '';
+      logger.info(`LinkedIn: session valid — logged in as ${name}`);
+      return true;
+    } catch (err) {
+      const status = err.response?.status;
+      logger.error(`LinkedIn session check failed: ${status || err.message}`);
+
+      if (status === 401 || status === 403) {
+        logger.error('LinkedIn: cookie li_at expired or invalid');
+        this.enabled = false;
+      }
+
+      return false;
+    }
+  }
+
+  // Fetch CSRF token from LinkedIn if not provided
+  async _fetchCsrfToken() {
+    try {
+      const res = await axios.get('https://www.linkedin.com/', {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+          Cookie: `li_at=${this.cookie}`,
+        },
+        maxRedirects: 5,
+        timeout: 15000,
+      });
+
+      // Extract JSESSIONID from response cookies
+      const setCookies = res.headers['set-cookie'] || [];
+      for (const c of setCookies) {
+        const match = c.match(/JSESSIONID="?([^";]+)"?/);
+        if (match) {
+          this.csrfToken = match[1].replace(/"/g, '');
+          logger.info(`LinkedIn: CSRF token fetched: ${this.csrfToken.substring(0, 10)}...`);
+          return;
+        }
+      }
+
+      // Fallback: try to find in page content
+      const bodyMatch = (res.data || '').toString().match(/"jsessionid"\s*:\s*"([^"]+)"/);
+      if (bodyMatch) {
+        this.csrfToken = bodyMatch[1];
+        logger.info(`LinkedIn: CSRF token from body: ${this.csrfToken.substring(0, 10)}...`);
+        return;
+      }
+
+      logger.warn('LinkedIn: could not auto-fetch CSRF token — set LINKEDIN_CSRF_TOKEN manually');
+    } catch (err) {
+      logger.error(`LinkedIn CSRF fetch error: ${err.message}`);
+    }
+  }
+
+  // ============================================================
+  //  SCAN
   // ============================================================
 
   async scan() {
     if (!this.enabled) return [];
-
-    const valid = await this.checkSession();
-    if (!valid) {
-      logger.error('LinkedIn: session expired — update LINKEDIN_LI_AT cookie');
-      return [];
-    }
 
     const results = [];
     const searchQueries = [
@@ -74,7 +163,7 @@ class LinkedInScanner {
         logger.error(`LinkedIn search error (${query}): ${err.message}`);
 
         if (err.response?.status === 401 || err.response?.status === 403) {
-          logger.error('LinkedIn: authentication failed — cookie expired');
+          logger.error('LinkedIn: auth failed during search');
           this.enabled = false;
           return results;
         }
@@ -82,6 +171,13 @@ class LinkedInScanner {
         if (err.response?.status === 429) {
           logger.warn('LinkedIn: rate limited — pausing 10 minutes');
           await this._sleep(600000);
+        }
+
+        // Redirect loop = session/csrf issue
+        if (err.message?.includes('redirect')) {
+          logger.error('LinkedIn: redirect loop — CSRF token may be invalid');
+          // Try to refresh CSRF token
+          await this._fetchCsrfToken();
         }
       }
     }
@@ -94,43 +190,43 @@ class LinkedInScanner {
   async _searchPosts(query) {
     const posts = [];
 
-    try {
-      const res = await axios.get(
-        'https://www.linkedin.com/voyager/api/search/dash/clusters',
-        {
-          headers: this.headers,
-          params: {
-            decorationId:
-              'com.linkedin.voyager.dash.deco.search.SearchClusterCollection-175',
-            origin: 'GLOBAL_SEARCH_HEADER',
-            q: 'all',
-            query: `(keywords:${encodeURIComponent(query)},datePosted:(r86400),resultType:(CONTENT))`,
-            start: 0,
-            count: 20,
-          },
-          timeout: 15000,
-        }
-      );
-
-      const elements = this._extractPosts(res.data);
-
-      for (const post of elements) {
-        if (this._isRelevant(post.text) && !this.store.hasReplied('linkedin', post.id)) {
-          posts.push({
-            id: post.id,
-            platform: 'linkedin',
-            title: post.text.substring(0, 100),
-            content: post.text,
-            author: post.authorName,
-            authorUrn: post.authorUrn,
-            postUrn: post.postUrn,
-            url: `https://www.linkedin.com/feed/update/${post.postUrn}/`,
-            created: new Date(post.timestamp || Date.now()),
-          });
-        }
+    const res = await axios.get(
+      'https://www.linkedin.com/voyager/api/search/dash/clusters',
+      {
+        headers: this._getHeaders(),
+        params: {
+          decorationId:
+            'com.linkedin.voyager.dash.deco.search.SearchClusterCollection-175',
+          origin: 'GLOBAL_SEARCH_HEADER',
+          q: 'all',
+          query: `(keywords:${encodeURIComponent(query)},datePosted:(r86400),resultType:(CONTENT))`,
+          start: 0,
+          count: 20,
+        },
+        timeout: 20000,
+        maxRedirects: 3,
       }
-    } catch (err) {
-      throw err;
+    );
+
+    const elements = this._extractPosts(res.data);
+
+    for (const post of elements) {
+      if (this._isRelevant(post.text) && !this.store.hasReplied('linkedin', post.id)) {
+        posts.push({
+          id: post.id,
+          platform: 'linkedin',
+          title: post.text.substring(0, 100),
+          content: post.text,
+          text: post.text,
+          author: post.authorName,
+          authorUrn: post.authorUrn,
+          postUrn: post.postUrn,
+          category: config.categorizePost(post.text),
+          score: this._scorePost(post.text),
+          url: `https://www.linkedin.com/feed/update/${post.postUrn}/`,
+          created: new Date(post.timestamp || Date.now()),
+        });
+      }
     }
 
     return posts;
@@ -178,33 +274,37 @@ class LinkedInScanner {
   }
 
   // ============================================================
-  //  REPLY — Poster un commentaire via Voyager API
+  //  REPLY
   // ============================================================
 
   async reply(post) {
     if (!this.enabled) return false;
 
+    const isDryRun = process.env.DRY_RUN === 'true';
+
     try {
-      const category = config.categorizePost(post.content);
+      const category = config.categorizePost(post.content || post.text);
       const replyText = await this.replyGen.generateReply(
-        post.content,
+        post.content || post.text,
         'linkedin',
         category
       );
 
       const activityUrn = this._extractActivityUrn(post.postUrn);
       if (!activityUrn) {
-        logger.warn(`LinkedIn: cannot extract activity URN for ${post.id}`);
+        logger.warn(`LinkedIn: no valid URN for ${post.id} — skipping`);
         this.store.markReplied('linkedin', post.id);
         return false;
       }
 
-      // Normaliser l'URN pour l'API comments
-      // Format attendu : urn:li:activity:XXXX ou urn:li:ugcPost:XXXX
-      const encodedUrn = encodeURIComponent(activityUrn);
+      if (isDryRun) {
+        logger.info(`[DRY RUN] Would reply to ${post.id}: "${replyText.substring(0, 80)}..."`);
+        this.store.markReplied('linkedin', post.id);
+        return true;
+      }
 
       await axios.post(
-        `https://www.linkedin.com/voyager/api/feed/comments`,
+        'https://www.linkedin.com/voyager/api/feed/comments',
         {
           threadId: activityUrn,
           attributed: {
@@ -213,31 +313,28 @@ class LinkedInScanner {
         },
         {
           headers: {
-            ...this.headers,
+            ...this._getHeaders(),
             'Content-Type': 'application/json',
             'x-restli-method': 'create',
           },
           timeout: 15000,
+          maxRedirects: 3,
         }
       );
 
       this.store.markReplied('linkedin', post.id);
-      logger.info(`✅ LinkedIn reply sent | ${post.author} | ${post.id}`);
-      logger.info(`   Category: ${category}`);
-      logger.info(`   Reply: ${replyText.substring(0, 120)}...`);
+      logger.info(`✅ LinkedIn reply | ${post.author} | cat=${category}`);
+      logger.info(`   "${replyText.substring(0, 120)}..."`);
 
-      // Pause longue (60-180 sec) — LinkedIn détecte les patterns non-humains
       await this._sleep(60000 + Math.random() * 120000);
       return true;
     } catch (err) {
-      logger.error(`LinkedIn reply error (${post.id}): ${err.message}`);
+      logger.error(`LinkedIn reply error (${post.id}): ${err.response?.status || err.message}`);
 
       if (err.response?.status === 401 || err.response?.status === 403) {
-        logger.error('LinkedIn: auth failed on reply — cookie expired');
         this.enabled = false;
       }
       if (err.response?.status === 429) {
-        logger.warn('LinkedIn: rate limit on reply — pausing 15 minutes');
         await this._sleep(900000);
       }
       if (err.response?.status === 404) {
@@ -249,32 +346,8 @@ class LinkedInScanner {
   }
 
   // ============================================================
-  //  SESSION & HELPERS
+  //  HELPERS
   // ============================================================
-
-  async checkSession() {
-    try {
-      const res = await axios.get(
-        'https://www.linkedin.com/voyager/api/me',
-        { headers: this.headers, timeout: 10000 }
-      );
-
-      // Différentes structures possibles selon la version
-      const profile = res.data?.miniProfile || res.data || {};
-      const name =
-        profile.firstName ||
-        res.data?.firstName?.localized?.fr_FR ||
-        res.data?.firstName?.localized?.en_US ||
-        'Unknown';
-
-      this._myUrn = profile.entityUrn || res.data?.entityUrn || '';
-      logger.info(`LinkedIn: session valid — logged in as ${name}`);
-      return true;
-    } catch (err) {
-      logger.error(`LinkedIn session check failed: ${err.response?.status || err.message}`);
-      return false;
-    }
-  }
 
   _extractActivityUrn(postUrn) {
     if (!postUrn) return null;
@@ -294,6 +367,31 @@ class LinkedInScanner {
       ...config.keywords.pain_points,
     ];
     return allKeywords.some((kw) => lower.includes(kw.toLowerCase()));
+  }
+
+  _scorePost(text) {
+    if (!text) return 0;
+    const lower = text.toLowerCase();
+    let score = 0;
+    for (const kw of config.keywords.primary) {
+      if (lower.includes(kw.toLowerCase())) score += 3;
+    }
+    for (const kw of config.keywords.pain_points) {
+      if (lower.includes(kw.toLowerCase())) score += 2;
+    }
+    for (const kw of config.keywords.secondary) {
+      if (lower.includes(kw.toLowerCase())) score += 1;
+    }
+    return score;
+  }
+
+  _randomHex(len) {
+    const chars = '0123456789abcdef';
+    let result = '';
+    for (let i = 0; i < len; i++) {
+      result += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return result;
   }
 
   _sleep(ms) {

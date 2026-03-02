@@ -10,6 +10,7 @@
     "axios": "^1.13.6",
     "cheerio": "^1.2.0",
     "dotenv": "^16.6.1",
+    "https-proxy-agent": "^7.0.6",
     "node-cron": "^3.0.3",
     "snoowrap": "^1.23.0",
     "winston": "^3.19.0"
